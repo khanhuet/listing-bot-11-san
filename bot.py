@@ -1,4 +1,3 @@
-
 import os, re, sqlite3, requests, asyncio, logging, json, threading
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -10,96 +9,157 @@ from flask import Flask
 # --- Web server for Render Free ---
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Bot is running! - 11 exchanges monitoring"
+def home(): return "Listing Bot V2 Optimized - Running"
 def run_web():
     try:
         app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
     except: pass
 threading.Thread(target=run_web, daemon=True).start()
-# -----------------------------------
 
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-
-if not BOT_TOKEN or not CHAT_ID:
-    raise ValueError("Thieu TELEGRAM_BOT_TOKEN hoac CHAT_ID trong .env / Environment Variables")
-
 bot = Bot(token=BOT_TOKEN)
 scheduler = AsyncIOScheduler()
 logging.basicConfig(level=logging.INFO)
 
-# DB
 conn = sqlite3.connect('listings.db', check_same_thread=False)
 conn.execute('CREATE TABLE IF NOT EXISTS sent (id TEXT PRIMARY KEY)')
 def is_sent(_id): return conn.execute('SELECT 1 FROM sent WHERE id=?', (_id,)).fetchone() is not None
-def mark_sent(_id): 
-    try:
-        conn.execute('INSERT OR IGNORE INTO sent VALUES (?)', (_id,))
-        conn.commit()
+def mark_sent(_id):
+    try: conn.execute('INSERT OR IGNORE INTO sent VALUES (?)', (_id,)); conn.commit()
     except: pass
 
-def ai_extract_token_and_time(title, content):
-    if OPENAI_KEY:
-        try:
-            from openai import OpenAI
-            client = OpenAI(api_key=OPENAI_KEY)
-            prompt = f"""Extract JSON from this crypto listing announcement. Title: {title} Content: {content[:3000]} Return ONLY JSON: {{"token": "SYMBOL", "trading_time_utc": "2026-05-20T10:00:00Z or null"}}"""
-            resp = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role":"user","content":prompt}], temperature=0)
-            data = json.loads(resp.choices[0].message.content)
-            tt = date_parser.parse(data['trading_time_utc']) if data.get('trading_time_utc') else None
-            return data.get('token'), tt
-        except Exception as e:
-            logging.warning(f"AI parser fail: {e}")
-    token_match = re.search(r'\$?([A-Z]{2,10})\b', title)
-    token = token_match.group(1) if token_match else "NEW"
-    m = re.search(r'(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2})', content)
-    t = None
-    try:
-        if m: t = date_parser.parse(m.group(1))
-    except: pass
-    return token, t
-
-async def send_channel(exchange, token, title, link, trade_time=None):
-    emoji_map = {"BINANCE":"🟡","OKX":"⬛","MEXC":"💚","BITGET":"🔵","GATE":"⚪️","UPBIT":"🟠","KUCOIN":"🟢","BYBIT":"🟠","HTX":"🔴","BINGX":"🔷","LBANK":"🔶"}
-    emoji = emoji_map.get(exchange, "💎")
-    msg = f"{emoji} <b>[{exchange}] NEW LISTING</b>\n\n💎 <b>${token}</b>\n📢 {title}\n"
-    if trade_time:
-        try: msg += f"⏰ Trade: <b>{trade_time.strftime('%H:%M UTC %d/%m')}</b>\n"
-        except: pass
-    msg += f"\n#{token} #{exchange} #Listing"
-    buttons = [[InlineKeyboardButton("📄 Announcement", url=link)]]
-    try:
-        await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(buttons), disable_web_page_preview=True)
-    except Exception as e:
-        logging.error(f"Send fail {e}")
-
-async def send_t10_alert(exchange, token, trade_time):
-    msg = f"⏰ <b>SẮP TRADE - 10P NỮA!</b>\n\n💎 <b>${token}</b> trên <b>{exchange}</b>\n🕐 Mở lúc {trade_time.strftime('%H:%M UTC')}\n👉 Chuẩn bị USDT!"
-    try: await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='HTML')
-    except Exception as e: logging.error(f"T-10 fail {e}")
-
-def schedule_t10(exchange, token, trade_time):
-    if not trade_time: return
-    try:
-        alert_time = trade_time - timedelta(minutes=10)
-        if alert_time > datetime.utcnow() + timedelta(minutes=1):
-            scheduler.add_job(send_t10_alert, 'date', run_date=alert_time, args=[exchange, token, trade_time], id=f"{exchange}_{token}_{int(trade_time.timestamp())}_{os.urandom(2).hex()}")
-            logging.info(f"Hẹn T-10 {token} {exchange} {alert_time}")
-    except: pass
-
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json"}
+HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
 def safe_json_get(url, headers=None, timeout=15):
     try:
         r = requests.get(url, headers=headers or HEADERS, timeout=timeout)
         if r.status_code != 200 or not r.text.strip(): return None
         return r.json()
-    except Exception as e:
-        logging.warning(f"API warn {url[:60]} -> {e}")
-        return None
+    except: return None
 
+# --- TỐI ƯU THÔNG TIN TOKEN ---
+def extract_contract(text):
+    # 0x... EVM, Solana base58 32-44 chars
+    evm = re.search(r'0x[a-fA-F0-9]{40}', text)
+    if evm: return evm.group(0)
+    sol = re.search(r'[1-9A-HJ-NP-Za-km-z]{32,44}', text)
+    # tránh nhầm id thường
+    if sol and len(sol.group(0)) > 32: return sol.group(0)
+    return None
+
+def extract_website(text):
+    m = re.search(r'(https?://[^\s\)"]+\.(?:com|io|xyz|app|network|org|finance)[^\s\)"]*)', text, re.I)
+    if m:
+        url = m.group(1)
+        if 'binance.com' not in url and 'okx.com' not in url and 'mexc.com' not in url: # loại link sàn
+            return url
+    return None
+
+def get_token_info(symbol):
+    """Lấy contract, website, CMC từ CoinGecko"""
+    info = {"contract": None, "website": None, "cmc": None, "listed_on": []}
+    try:
+        # 1. Search coingecko
+        s = safe_json_get(f"https://api.coingecko.com/api/v3/search?query={symbol}")
+        if not s or not s.get('coins'): return info
+        # lấy coin khớp symbol nhất
+        coin = next((c for c in s['coins'] if c['symbol'].lower() == symbol.lower()), s['coins'][0])
+        coin_id = coin['id']
+        
+        # 2. Detail để lấy contract, website, cmc không có nhưng có link
+        d = safe_json_get(f"https://api.coingecko.com/api/v3/coins/{coin_id}?localization=false&tickers=true&market_data=false&community_data=false&developer_data=false")
+        if d:
+            platforms = d.get('platforms', {})
+            # ưu tiên EVM
+            for plat in ['ethereum', 'bnb-smart-chain', 'arbitrum-one', 'base', 'polygon-pos', 'solana']:
+                if platforms.get(plat): 
+                    info['contract'] = platforms[plat]
+                    break
+            if not info['contract']:
+                for v in platforms.values():
+                    if v: 
+                        info['contract'] = v
+                        break
+            links = d.get('links', {})
+            if links.get('homepage') and links['homepage'][0]:
+                info['website'] = links['homepage'][0]
+            # tickers = các sàn đã list
+            tickers = d.get('tickers', [])[:30]
+            exchanges = list(set([t['market']['name'] for t in tickers if t.get('market')]))
+            info['listed_on'] = exchanges[:8]
+
+        # 3. CMC link
+        info['cmc'] = f"https://coinmarketcap.com/currencies/{coin_id}/" if coin_id else f"https://coinmarketcap.com/search/?query={symbol}"
+    except Exception as e:
+        logging.warning(f"get_token_info {symbol} fail {e}")
+    return info
+
+def parse_token_symbol(title):
+    # Ưu tiên (TOKEN) hoặc $TOKEN
+    m = re.search(r'\(([A-Z0-9]{2,12})\)', title)
+    if m: return m.group(1)
+    m = re.search(r'\$([A-Z]{2,12})\b', title)
+    if m: return m.group(1)
+    m = re.search(r'\b([A-Z]{2,10})\b.*(?:will be listed|listing|to list)', title, re.I)
+    if m: return m.group(1).upper()
+    m = re.search(r'\b([A-Z]{2,10})\b', title)
+    return m.group(1) if m else "NEW"
+
+async def send_optimized(exchange, token, title, link, trade_time=None, raw_content=""):
+    # Chỉ gửi khi mới
+    if is_sent(f"{exchange}_{token}_{link}") : return
+    
+    # Lấy thêm thông tin
+    contract_from_ann = extract_contract(raw_content + " " + title)
+    web_from_ann = extract_website(raw_content)
+    
+    token_info = get_token_info(token) if token != "NEW" else {"contract": contract_from_ann, "website": web_from_ann, "cmc": None, "listed_on": []}
+    
+    contract = contract_from_ann or token_info.get('contract')
+    website = web_from_ann or token_info.get('website')
+    cmc = token_info.get('cmc') or f"https://coinmarketcap.com/search/?query={token}"
+    listed = token_info.get('listed_on', [])
+
+    # --- FORMAT GỌN, KHÔNG HASHTAG ---
+    lines = []
+    lines.append(f"🔔 <b>${token} | {exchange} LISTING</b>")
+    lines.append("")
+    lines.append(f"📰 {title[:180]}")
+    if trade_time:
+        try: lines.append(f"⏰ Trade: <b>{trade_time.strftime('%H:%M UTC - %d/%m')}</b>")
+        except: pass
+    lines.append("")
+    if website: lines.append(f"🌐 <a href='{website}'>{website.replace('https://','')[:35]}</a>")
+    if contract: lines.append(f"📜 <code>{contract[:6]}...{contract[-4:]}</code>")
+    if cmc: lines.append(f"📊 <a href='{cmc}'>CoinMarketCap</a>")
+    if listed:
+        # lọc trùng sàn hiện tại
+        other = [x for x in listed if exchange.lower() not in x.lower()][:5]
+        if other: lines.append(f"🔄 Đã có trên: {', '.join(other)}")
+    lines.append("")
+    lines.append(f"🔗 <a href='{link}'>Announcement gốc</a>")
+
+    msg = "\n".join(lines)
+    
+    # Fix link gốc sai -> thêm nút chuẩn
+    buttons = [[InlineKeyboardButton("📄 Xem Ann Gốc", url=link)]]
+    if website: buttons.append([InlineKeyboardButton("🌐 Website", url=website)])
+    if cmc: buttons.append([InlineKeyboardButton("📊 CMC/CG", url=cmc)])
+
+    try:
+        await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(buttons), disable_web_page_preview=True)
+        mark_sent(f"{exchange}_{token}_{link}")
+        # hẹn T-10
+        if trade_time:
+            alert_time = trade_time - timedelta(minutes=10)
+            if alert_time > datetime.utcnow() + timedelta(minutes=1):
+                scheduler.add_job(lambda: asyncio.create_task(bot.send_message(chat_id=CHAT_ID, text=f"⏰ <b>SẮP TRADE 10P!</b>\n\n<b>${token}</b> trên {exchange} lúc {trade_time.strftime('%H:%M UTC')}\n<a href='{link}'>Chuẩn bị USDT!</a>", parse_mode='HTML')), 'date', run_date=alert_time)
+    except Exception as e:
+        logging.error(f"Send fail {e}")
+
+# --- CHECK CÁC SÀN - ĐÃ FIX LINK GỐC ---
 async def check_binance():
     try:
         data = safe_json_get("https://www.binance.com/bapi/composite/v1/public/cms/article/list/query?type=1&pageNo=1&pageSize=5&catalogId=48")
@@ -108,14 +168,16 @@ async def check_binance():
             _id = f"BINANCE_{art['code']}"
             if is_sent(_id): continue
             title = art['title']
-            if "will list" in title.lower() or "to list" in title.lower():
-                detail = safe_json_get(f"https://www.binance.com/bapi/composite/v1/public/cms/article/detail/query?articleCode={art['code']}")
-                content = str(detail) if detail else title
-                token, ttime = ai_extract_token_and_time(title, content)
-                link = f"https://www.binance.com/en/support/announcement/{art['code']}"
-                await send_channel("BINANCE", token, title, link, ttime)
-                if ttime: schedule_t10("BINANCE", token, ttime)
-                mark_sent(_id)
+            if "will list" not in title.lower() and "to list" not in title.lower(): continue
+            detail = safe_json_get(f"https://www.binance.com/bapi/composite/v1/public/cms/article/detail/query?articleCode={art['code']}")
+            content = json.dumps(detail) if detail else title
+            token = parse_token_symbol(title)
+            # LINK CHUẨN BINANCE
+            link = f"https://www.binance.com/en/support/announcement/detail/{art['code']}"
+            m = re.search(r'(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2})', content)
+            t = date_parser.parse(m.group(1)) if m else None
+            await send_optimized("BINANCE", token, title, link, t, content)
+            mark_sent(_id)
     except Exception as e: logging.error(f"Binance {e}")
 
 async def check_okx():
@@ -126,10 +188,11 @@ async def check_okx():
             _id = f"OKX_{item['annId']}"
             if is_sent(_id): continue
             title = item['title']
-            token, ttime = ai_extract_token_and_time(title, title)
-            link = f"https://www.okx.com/help/{item['url']}"
-            await send_channel("OKX", token, title, link, ttime)
-            if ttime: schedule_t10("OKX", token, ttime)
+            token = parse_token_symbol(title)
+            # LINK CHUẨN OKX - fix lỗi sai link cũ
+            p_url = item.get('url','')
+            link = f"https://www.okx.com{'' if p_url.startswith('/') else '/help/'}"+p_url if p_url else f"https://www.okx.com/help/section/announcements"
+            await send_optimized("OKX", token, title, link, None, title)
             mark_sent(_id)
     except Exception as e: logging.error(f"OKX {e}")
 
@@ -141,10 +204,9 @@ async def check_bybit():
             _id = f"BYBIT_{item['id']}"
             if is_sent(_id): continue
             title = item['title']
-            token, ttime = ai_extract_token_and_time(title, item.get('description',''))
-            link = item.get('url','https://announcements.bybit.com')
-            await send_channel("BYBIT", token, title, link, ttime)
-            if ttime: schedule_t10("BYBIT", token, ttime)
+            token = parse_token_symbol(title)
+            link = item.get('url') or f"https://announcements.bybit.com/en-US/article/{item.get('id','')}"
+            await send_optimized("BYBIT", token, title, link, None, item.get('description',''))
             mark_sent(_id)
     except Exception as e: logging.error(f"Bybit {e}")
 
@@ -156,9 +218,9 @@ async def check_gate():
             _id = f"GATE_{art['id']}"
             if is_sent(_id): continue
             title = art['title']
-            token, ttime = ai_extract_token_and_time(title, title)
-            await send_channel("GATE", token, title, f"https://www.gate.io/announcements/article/{art['id']}", ttime)
-            if ttime: schedule_t10("GATE", token, ttime)
+            token = parse_token_symbol(title)
+            link = f"https://www.gate.io/announcements/article/{art['id']}"
+            await send_optimized("GATE", token, title, link, None, title)
             mark_sent(_id)
     except Exception as e: logging.error(f"Gate {e}")
 
@@ -171,11 +233,11 @@ async def check_mexc():
             title = art.get('title','')
             _id = f"MEXC_{art.get('id', title)}"
             if is_sent(_id): continue
-            if "will list" in title.lower() or "listing" in title.lower():
-                token, ttime = ai_extract_token_and_time(title, title)
-                await send_channel("MEXC", token, title, f"https://www.mexc.com/news/{art.get('id','')}", ttime)
-                if ttime: schedule_t10("MEXC", token, ttime)
-                mark_sent(_id)
+            if "will list" not in title.lower() and "listing" not in title.lower(): continue
+            token = parse_token_symbol(title)
+            link = f"https://www.mexc.com/news/{art.get('id','')}"
+            await send_optimized("MEXC", token, title, link, None, title)
+            mark_sent(_id)
     except Exception as e: logging.error(f"MEXC {e}")
 
 async def check_bitget():
@@ -187,9 +249,9 @@ async def check_bitget():
             _id = f"BITGET_{art.get('id')}"
             if is_sent(_id): continue
             title = art.get('annTitle','')
-            token, ttime = ai_extract_token_and_time(title, art.get('annDesc',''))
-            await send_channel("BITGET", token, title, f"https://www.bitget.com/support/articles/{art.get('id')}", ttime)
-            if ttime: schedule_t10("BITGET", token, ttime)
+            token = parse_token_symbol(title)
+            link = f"https://www.bitget.com/support/articles/{art.get('id')}"
+            await send_optimized("BITGET", token, title, link, None, art.get('annDesc',''))
             mark_sent(_id)
     except Exception as e: logging.error(f"Bitget {e}")
 
@@ -202,55 +264,11 @@ async def check_kucoin():
             _id = f"KUCOIN_{art.get('id')}"
             if is_sent(_id): continue
             title = art.get('title','')
-            token, ttime = ai_extract_token_and_time(title, art.get('summary',''))
-            await send_channel("KUCOIN", token, title, f"https://www.kucoin.com/news/{art.get('id')}", ttime)
-            if ttime: schedule_t10("KUCOIN", token, ttime)
+            token = parse_token_symbol(title)
+            link = f"https://www.kucoin.com/announcement/{art.get('id')}"
+            await send_optimized("KUCOIN", token, title, link, None, art.get('summary',''))
             mark_sent(_id)
     except Exception as e: logging.error(f"Kucoin {e}")
-
-async def check_htx():
-    try:
-        data = safe_json_get("https://www.htx.com/-/x/hbg/v1/announcement/list?limit=5&r=new-listing")
-        if not data: return
-        for art in data.get('data',{}).get('list',[]):
-            _id = f"HTX_{art['id']}"
-            if is_sent(_id): continue
-            title = art['title']
-            token, ttime = ai_extract_token_and_time(title, title)
-            await send_channel("HTX", token, title, f"https://www.htx.com/support/{art['id']}", ttime)
-            if ttime: schedule_t10("HTX", token, ttime)
-            mark_sent(_id)
-    except Exception as e: logging.error(f"HTX {e}")
-
-async def check_bingx():
-    try:
-        data = safe_json_get("https://www.bingx.com/api/cms/v1/notice/list?current=1&size=5&type=1")
-        if not data: return
-        for art in data.get('data',{}).get('records',[]):
-            if "listing" not in art.get('title','').lower(): continue
-            _id = f"BINGX_{art['id']}"
-            if is_sent(_id): continue
-            title = art['title']
-            token, ttime = ai_extract_token_and_time(title, title)
-            await send_channel("BINGX", token, title, f"https://bingx.com/en-us/support/articles/{art['id']}/", ttime)
-            if ttime: schedule_t10("BINGX", token, ttime)
-            mark_sent(_id)
-    except Exception as e: logging.error(f"BingX {e}")
-
-async def check_lbank():
-    try:
-        data = safe_json_get("https://www.lbank.com/api/cms/lbank/announcement/list?category=1&page=1&size=5")
-        if not data: return
-        for art in data.get('data',{}).get('list',[]):
-            title = art.get('title','')
-            _id = f"LBANK_{art.get('id', title)}"
-            if is_sent(_id): continue
-            if "will list" in title.lower():
-                token, ttime = ai_extract_token_and_time(title, title)
-                await send_channel("LBANK", token, title, f"https://www.lbank.com/en-US/announcement/{art.get('id','')}", ttime)
-                if ttime: schedule_t10("LBANK", token, ttime)
-                mark_sent(_id)
-    except Exception as e: logging.error(f"Lbank {e}")
 
 async def check_upbit():
     try:
@@ -260,25 +278,23 @@ async def check_upbit():
             _id = f"UPBIT_{art['id']}"
             if is_sent(_id): continue
             title = art['title']
-            if "listing" in title.lower() or "support" in title.lower():
-                token, ttime = ai_extract_token_and_time(title, title)
-                await send_channel("UPBIT", token, title, f"https://upbit.com/service_center/notice?id={art['id']}", ttime)
-                if ttime: schedule_t10("UPBIT", token, ttime)
-                mark_sent(_id)
+            if "listing" not in title.lower() and "support" not in title.lower(): continue
+            token = parse_token_symbol(title)
+            link = f"https://upbit.com/service_center/notice?id={art['id']}"
+            await send_optimized("UPBIT", token, title, link, None, title)
+            mark_sent(_id)
     except Exception as e: logging.error(f"Upbit {e}")
 
 async def main_loop():
     scheduler.start()
-    logging.info(f"Bot started for channel {CHAT_ID}")
-    try:
-        await bot.send_message(chat_id=CHAT_ID, text="✅ <b>Listing Bot đã online (Free Web Service)</b>\nĐang theo dõi 11 sàn: Binance, OKX, MEXC, Bitget, Gate, Upbit, Kucoin, Bybit, HTX, BingX, Lbank", parse_mode='HTML')
+    logging.info("Bot V2 Optimized started")
+    try: await bot.send_message(chat_id=CHAT_ID, text="✅ <b>Bot V2 Optimized đã online</b>\nFormat gọn - Có Contract/Web/CMC - Check sàn đã list", parse_mode='HTML')
     except: pass
     while True:
         try:
-            await asyncio.gather(check_binance(), check_okx(), check_bybit(), check_gate(), check_mexc(), check_bitget(), check_kucoin(), check_htx(), check_bingx(), check_lbank(), check_upbit())
-        except Exception as e:
-            logging.error(f"Loop error {e}")
-        await asyncio.sleep(45)
+            await asyncio.gather(check_binance(), check_okx(), check_bybit(), check_gate(), check_mexc(), check_bitget(), check_kucoin(), check_upbit())
+        except Exception as e: logging.error(f"Loop {e}")
+        await asyncio.sleep(30) # check nhanh hơn, chỉ báo khi mới
 
 if __name__ == "__main__":
     asyncio.run(main_loop())
