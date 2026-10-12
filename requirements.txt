@@ -1,9 +1,7 @@
 python-telegram-bot==20.7
 requests
-beautifulsoup4
-apscheduler
 python-dotenv
-lxml
+apscheduler
 python-dateutil
 openai
 flask
