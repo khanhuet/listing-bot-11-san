@@ -1,0 +1,10 @@
+version: '3.8'
+services:
+  listing-bot:
+    build: .
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./listings.db:/app/listings.db
+      - ./logs:/app/logs
